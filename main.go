@@ -85,6 +85,8 @@ func (m *IPBlocker) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddy
 		return err
 	}
 
+	caddy.Log().Info("client IP: ", zap.String("ip", clientIP))
+
 	m.mu.RLock()
 	_, blocked := m.blockedIPs[clientIP]
 	m.mu.RUnlock()
@@ -151,6 +153,9 @@ func (m *IPBlocker) refreshBlockList() error {
 	m.mu.Lock()
 	m.blockedIPs = newBlockedIPs
 	m.mu.Unlock()
+
+	// 日志输出 IP 列表
+	caddy.Log().Info("block list updated: ", zap.Strings("ips", ipList))
 
 	return nil
 }
