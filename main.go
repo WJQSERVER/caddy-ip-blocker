@@ -138,7 +138,7 @@ func (m *IPBlocker) startRefreshingBlockList(interval time.Duration) {
 func (m *IPBlocker) getClientIP(r *http.Request) (net.IP, error) {
 	var ipStr string
 
-	// 如果信任代理头，则尝试从自定义来源标头中获取 IP
+	// 1. 优先尝试从自定义来源标头中获取 IP
 	if m.TrustProxy && len(m.SourceHeaders) > 0 {
 		for _, header := range m.SourceHeaders {
 			if value := r.Header.Get(header); value != "" {
@@ -151,7 +151,21 @@ func (m *IPBlocker) getClientIP(r *http.Request) (net.IP, error) {
 		}
 	}
 
-	// 如果未从自定义来源标头中获取到 IP，则尝试从 RemoteAddr 中获取
+	// 2. 如果自定义标头未找到有效 IP，尝试从默认标头中获取
+	if ipStr == "" && m.TrustProxy {
+		if forwarded := r.Header.Get("X-Forwarded-For"); forwarded != "" {
+			ips := strings.Split(forwarded, ",")
+			if len(ips) > 0 {
+				ipStr = strings.TrimSpace(ips[0])
+			}
+		}
+
+		if ipStr == "" {
+			ipStr = r.Header.Get("X-Real-IP")
+		}
+	}
+
+	// 3. 如果仍未找到有效 IP，回退到 RemoteAddr
 	if ipStr == "" {
 		var err error
 		ipStr, _, err = net.SplitHostPort(r.RemoteAddr)
