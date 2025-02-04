@@ -25,9 +25,10 @@ func init() {
 
 // IPBlocker 是插件的主要结构体，负责管理 IP 阻止逻辑
 type IPBlocker struct {
-	BlockListURL    string `json:"block_list_url,omitempty"`    // 阻止列表的 URL
-	RefreshInterval string `json:"refresh_interval,omitempty"` // 刷新阻止列表的间隔时间
-	TrustProxy      bool   `json:"trust_proxy,omitempty"`      // 是否信任代理头
+	BlockListURL    string   `json:"block_list_url,omitempty"`    // 阻止列表的 URL
+	RefreshInterval string   `json:"refresh_interval,omitempty"` // 刷新阻止列表的间隔时间
+	TrustProxy      bool     `json:"trust_proxy,omitempty"`      // 是否信任代理头
+	SourceHeaders   []string `json:"source_headers,omitempty"`   // 自定义来源标头列表
 
 	blockedIPNets []*net.IPNet // 存储阻止的 IP 网段
 	mu            sync.RWMutex // 读写锁，用于保护阻止列表的并发访问
@@ -69,6 +70,7 @@ func (m *IPBlocker) Provision(ctx caddy.Context) error {
 	m.logger.Info("IPBlocker provisioned",
 		zap.Bool("trust_proxy", m.TrustProxy),
 		zap.String("refresh_interval", interval.String()),
+		zap.Strings("source_headers", m.SourceHeaders),
 	)
 	return nil
 }
@@ -136,21 +138,20 @@ func (m *IPBlocker) startRefreshingBlockList(interval time.Duration) {
 func (m *IPBlocker) getClientIP(r *http.Request) (net.IP, error) {
 	var ipStr string
 
-	// 如果信任代理头，则尝试从代理头中获取 IP
-	if m.TrustProxy {
-		if forwarded := r.Header.Get("X-Forwarded-For"); forwarded != "" {
-			ips := strings.Split(forwarded, ",")
-			if len(ips) > 0 {
-				ipStr = strings.TrimSpace(ips[0])
+	// 如果信任代理头，则尝试从自定义来源标头中获取 IP
+	if m.TrustProxy && len(m.SourceHeaders) > 0 {
+		for _, header := range m.SourceHeaders {
+			if value := r.Header.Get(header); value != "" {
+				ips := strings.Split(value, ",")
+				if len(ips) > 0 {
+					ipStr = strings.TrimSpace(ips[0])
+					break
+				}
 			}
-		}
-
-		if ipStr == "" {
-			ipStr = r.Header.Get("X-Real-IP")
 		}
 	}
 
-	// 如果未从代理头中获取到 IP，则从 RemoteAddr 中获取
+	// 如果未从自定义来源标头中获取到 IP，则尝试从 RemoteAddr 中获取
 	if ipStr == "" {
 		var err error
 		ipStr, _, err = net.SplitHostPort(r.RemoteAddr)
@@ -273,6 +274,12 @@ func (m *IPBlocker) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 				}
 			case "trust_proxy":
 				m.TrustProxy = true
+			case "source_headers":
+				args := d.RemainingArgs()
+				if len(args) == 0 {
+					return d.ArgErr()
+				}
+				m.SourceHeaders = args
 			default:
 				return d.Errf("unknown subdirective: %s", d.Val())
 			}
