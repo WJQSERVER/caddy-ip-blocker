@@ -3,7 +3,7 @@ package ipblocker
 import (
 	"encoding/json"
 	"errors"
-	"io/ioutil"
+	"io"
 	"net"
 	"net/http"
 	"sync"
@@ -13,6 +13,7 @@ import (
 	"github.com/caddyserver/caddy/v2/caddyconfig/caddyfile"
 	"github.com/caddyserver/caddy/v2/caddyconfig/httpcaddyfile"
 	"github.com/caddyserver/caddy/v2/modules/caddyhttp"
+	"go.uber.org/zap"
 )
 
 func init() {
@@ -63,6 +64,8 @@ func (m *IPBlocker) Provision(ctx caddy.Context) error {
 
 	// 启动后台任务定期刷新 IP 列表
 	go m.startRefreshingBlockList(interval)
+
+	caddy.Log().Info("IPBlocker is enabled")
 
 	return nil
 }
@@ -128,7 +131,7 @@ func (m *IPBlocker) refreshBlockList() error {
 		return errors.New("failed to fetch block list: " + resp.Status)
 	}
 
-	body, err := ioutil.ReadAll(resp.Body)
+	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return err
 	}
@@ -136,6 +139,7 @@ func (m *IPBlocker) refreshBlockList() error {
 	var ipList []string
 	err = json.Unmarshal(body, &ipList)
 	if err != nil {
+		caddy.Log().Error("failed to parse block list: ", zap.Error(err))
 		return err
 	}
 
