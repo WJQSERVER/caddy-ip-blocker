@@ -2,10 +2,10 @@ package ipblocker
 
 import (
 	"encoding/json"
-	"fmt"
+	"errors"
+	"io/ioutil"
 	"net"
 	"net/http"
-	"strings"
 	"sync"
 	"time"
 
@@ -13,205 +13,164 @@ import (
 	"github.com/caddyserver/caddy/v2/caddyconfig/caddyfile"
 	"github.com/caddyserver/caddy/v2/caddyconfig/httpcaddyfile"
 	"github.com/caddyserver/caddy/v2/modules/caddyhttp"
-	"go.uber.org/zap"
 )
 
 func init() {
+	// 注册模块
 	caddy.RegisterModule(IPBlocker{})
-	httpcaddyfile.RegisterHandlerDirective("ip_blocker", parseCaddyfile)
+	// 注册 Caddyfile 指令
+	httpcaddyfile.RegisterHandlerDirective("ipblocker", parseCaddyfile)
 }
 
-// parseCaddyfile parses Caddyfile configuration for the ip_blocker module.
-func parseCaddyfile(h httpcaddyfile.Helper) (caddyhttp.MiddlewareHandler, error) {
-	var m IPBlocker
-	err := m.UnmarshalCaddyfile(h.Dispenser)
-	if err != nil {
-		return nil, err
-	}
-	return &m, nil
-}
-
-// IPBlocker is a Caddy HTTP handler module that blocks requests from specific IPs or IP ranges.
+// IPBlocker 是一个 Caddy HTTP 中间件模块，用于拦截特定 IP。
 type IPBlocker struct {
-	JSONUrl  string        `json:"json_url,omitempty"`
-	Interval time.Duration `json:"interval,omitempty"`
+	// JSON 文件的 URL，包含需要拦截的 IP 列表
+	BlockListURL string `json:"block_list_url,omitempty"`
 
-	logger     *zap.Logger
-	httpClient *http.Client
-	blockedIPs []*net.IPNet
+	// 刷新 IP 列表的时间间隔
+	RefreshInterval string `json:"refresh_interval,omitempty"`
+
+	blockedIPs map[string]struct{}
 	mu         sync.RWMutex
 	stopChan   chan struct{}
 }
 
-// CaddyModule returns the Caddy module information.
+// CaddyModule 返回模块信息。
 func (IPBlocker) CaddyModule() caddy.ModuleInfo {
 	return caddy.ModuleInfo{
-		ID:  "http.handlers.ip_blocker",
+		ID:  "http.handlers.ipblocker",
 		New: func() caddy.Module { return new(IPBlocker) },
 	}
 }
 
-// Provision sets up the module with necessary defaults and initializes resources.
+// Provision 初始化模块。
 func (m *IPBlocker) Provision(ctx caddy.Context) error {
-	m.logger = ctx.Logger()
-	m.httpClient = &http.Client{Timeout: 10 * time.Second}
+	if m.BlockListURL == "" {
+		return errors.New("block_list_url is required")
+	}
+
+	if m.RefreshInterval == "" {
+		m.RefreshInterval = "5m" // 默认刷新间隔为 5 分钟
+	}
+
+	interval, err := time.ParseDuration(m.RefreshInterval)
+	if err != nil {
+		return err
+	}
+
+	m.blockedIPs = make(map[string]struct{})
 	m.stopChan = make(chan struct{})
 
-	// Set default interval if not provided
-	if m.Interval == 0 {
-		m.Interval = 5 * time.Minute
-		m.logger.Info("using default interval", zap.Duration("interval", m.Interval))
-	}
-
-	// Initial fetch of IPs
-	if err := m.fetchIPs(); err != nil {
-		return fmt.Errorf("initial IP fetch failed: %w", err)
-	}
-
-	// Start periodic updater
-	if m.Interval > 0 {
-		go m.updater()
-	}
+	// 启动后台任务定期刷新 IP 列表
+	go m.startRefreshingBlockList(interval)
 
 	return nil
 }
 
-// Validate checks the module's configuration for correctness.
+// Validate 验证模块配置。
 func (m *IPBlocker) Validate() error {
-	if m.JSONUrl == "" {
-		return fmt.Errorf("json_url is required")
+	if m.BlockListURL == "" {
+		return errors.New("block_list_url is required")
 	}
 	return nil
 }
 
-// Cleanup stops the periodic updater.
-func (m *IPBlocker) Cleanup() error {
-	close(m.stopChan)
-	return nil
-}
-
-// ServeHTTP handles HTTP requests and blocks those from blocked IPs.
+// ServeHTTP 拦截请求并检查客户端 IP。
 func (m *IPBlocker) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyhttp.Handler) error {
-	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	clientIP, _, err := net.SplitHostPort(r.RemoteAddr)
 	if err != nil {
-		m.logger.Warn("failed to parse RemoteAddr", zap.String("remote_addr", r.RemoteAddr))
-		return next.ServeHTTP(w, r)
+		return err
 	}
 
-	clientIP := net.ParseIP(host)
-	if clientIP == nil {
-		m.logger.Warn("failed to parse client IP", zap.String("remote_addr", r.RemoteAddr))
-		return next.ServeHTTP(w, r)
-	}
-
-	// Copy the blocked IP list to reduce lock contention
 	m.mu.RLock()
-	blockedIPs := m.blockedIPs
+	_, blocked := m.blockedIPs[clientIP]
 	m.mu.RUnlock()
 
-	for _, ipnet := range blockedIPs {
-		if ipnet.Contains(clientIP) {
-			m.logger.Debug("blocked request",
-				zap.String("ip", clientIP.String()),
-				zap.String("method", r.Method),
-				zap.String("path", r.URL.Path),
-				zap.String("user_agent", r.UserAgent()))
-
-			w.WriteHeader(http.StatusForbidden)
-			return nil
-		}
+	if blocked {
+		w.WriteHeader(http.StatusForbidden)
+		w.Write([]byte("403 Forbidden: Your IP is blocked"))
+		return nil
 	}
 
 	return next.ServeHTTP(w, r)
 }
 
-// updater periodically fetches the latest blocked IPs.
-func (m *IPBlocker) updater() {
-	ticker := time.NewTicker(m.Interval)
+// Cleanup 停止后台刷新任务。
+func (m *IPBlocker) Cleanup() error {
+	close(m.stopChan)
+	return nil
+}
+
+// startRefreshingBlockList 定期从 URL 拉取 IP 列表。
+func (m *IPBlocker) startRefreshingBlockList(interval time.Duration) {
+	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 
 	for {
 		select {
-		case <-ticker.C:
-			if err := m.fetchIPs(); err != nil {
-				m.logger.Error("failed to update IPs", zap.Error(err), zap.String("json_url", m.JSONUrl))
-			}
 		case <-m.stopChan:
 			return
+		case <-ticker.C:
+			m.refreshBlockList()
 		}
 	}
 }
 
-// fetchIPs fetches the blocked IP list from the JSON URL.
-func (m *IPBlocker) fetchIPs() error {
-	resp, err := m.httpClient.Get(m.JSONUrl)
+// refreshBlockList 从指定的 URL 拉取并解析 IP 列表。
+func (m *IPBlocker) refreshBlockList() error {
+	resp, err := http.Get(m.BlockListURL)
 	if err != nil {
-		return fmt.Errorf("failed to fetch IPs: %w", err)
+		return err
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("unexpected HTTP status: %s", resp.Status)
+		return errors.New("failed to fetch block list: " + resp.Status)
 	}
 
-	var ips []string
-	if err := json.NewDecoder(resp.Body).Decode(&ips); err != nil {
-		return fmt.Errorf("failed to decode JSON: %w", err)
+	body, err := ioutil.ReadAll(resp.Body)
+	if err != nil {
+		return err
 	}
 
-	var parsed []*net.IPNet
-	for _, ipStr := range ips {
-		ipStr = strings.TrimSpace(ipStr)
-		_, ipnet, err := net.ParseCIDR(ipStr)
-		if err != nil {
-			// Try parsing as a single IP
-			ip := net.ParseIP(ipStr)
-			if ip == nil {
-				m.logger.Warn("invalid IP format", zap.String("ip", ipStr))
-				continue
-			}
-			ipnet = &net.IPNet{
-				IP:   ip,
-				Mask: net.CIDRMask(32, 32),
-			}
-			if ip.To4() == nil {
-				ipnet.Mask = net.CIDRMask(128, 128)
-			}
-		}
-		parsed = append(parsed, ipnet)
+	var ipList []string
+	err = json.Unmarshal(body, &ipList)
+	if err != nil {
+		return err
+	}
+
+	newBlockedIPs := make(map[string]struct{})
+	for _, ip := range ipList {
+		newBlockedIPs[ip] = struct{}{}
 	}
 
 	m.mu.Lock()
-	m.blockedIPs = parsed
+	m.blockedIPs = newBlockedIPs
 	m.mu.Unlock()
-
-	m.logger.Info("updated blocked IP list",
-		zap.Int("count", len(parsed)),
-		zap.String("json_url", m.JSONUrl),
-		zap.Time("updated_at", time.Now()))
 
 	return nil
 }
 
-// UnmarshalCaddyfile implements custom Caddyfile parsing.
+// parseCaddyfile 解析 Caddyfile 配置。
+func parseCaddyfile(h httpcaddyfile.Helper) (caddyhttp.MiddlewareHandler, error) {
+	var m IPBlocker
+	err := m.UnmarshalCaddyfile(h.Dispenser)
+	return &m, err
+}
+
+// UnmarshalCaddyfile 从 Caddyfile 中解析模块配置。
 func (m *IPBlocker) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 	for d.Next() {
 		for d.NextBlock(0) {
 			switch d.Val() {
-			case "json_url":
-				if !d.Args(&m.JSONUrl) {
+			case "block_list_url":
+				if !d.Args(&m.BlockListURL) {
 					return d.ArgErr()
 				}
-			case "interval":
-				var intervalStr string
-				if !d.Args(&intervalStr) {
+			case "refresh_interval":
+				if !d.Args(&m.RefreshInterval) {
 					return d.ArgErr()
 				}
-				interval, err := time.ParseDuration(intervalStr)
-				if err != nil {
-					return d.Errf("invalid interval duration: %v", err)
-				}
-				m.Interval = interval
 			default:
 				return d.Errf("unknown subdirective: %s", d.Val())
 			}
@@ -220,10 +179,9 @@ func (m *IPBlocker) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 	return nil
 }
 
-// Interface guards
+// 确保接口实现正确
 var (
 	_ caddy.Provisioner           = (*IPBlocker)(nil)
-	_ caddy.CleanerUpper          = (*IPBlocker)(nil)
 	_ caddy.Validator             = (*IPBlocker)(nil)
 	_ caddyhttp.MiddlewareHandler = (*IPBlocker)(nil)
 	_ caddyfile.Unmarshaler       = (*IPBlocker)(nil)
