@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 
@@ -35,7 +36,7 @@ func (m *IPBlocker) Provision(ctx caddy.Context) error {
 
 	// Initial fetch
 	if err := m.fetchIPs(); err != nil {
-		return err
+		return fmt.Errorf("initial IP fetch failed: %w", err)
 	}
 
 	// Start updater
@@ -61,7 +62,7 @@ func (m *IPBlocker) updater() {
 		select {
 		case <-ticker.C:
 			if err := m.fetchIPs(); err != nil {
-				m.logger.Error("failed to update IPs", zap.Error(err))
+				m.logger.Error("failed to update IPs", zap.Error(err), zap.String("json_url", m.JSONUrl))
 			}
 		case <-m.stopChan:
 			return
@@ -72,22 +73,28 @@ func (m *IPBlocker) updater() {
 func (m *IPBlocker) fetchIPs() error {
 	resp, err := m.httpClient.Get(m.JSONUrl)
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to fetch IPs: %w", err)
 	}
 	defer resp.Body.Close()
 
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("unexpected HTTP status: %s", resp.Status)
+	}
+
 	var ips []string
 	if err := json.NewDecoder(resp.Body).Decode(&ips); err != nil {
-		return err
+		return fmt.Errorf("failed to decode JSON: %w", err)
 	}
 
 	var parsed []*net.IPNet
 	for _, ipStr := range ips {
+		ipStr = strings.TrimSpace(ipStr)
 		_, ipnet, err := net.ParseCIDR(ipStr)
 		if err != nil {
 			// Try parsing as single IP
 			ip := net.ParseIP(ipStr)
 			if ip == nil {
+				m.logger.Warn("invalid IP format", zap.String("ip", ipStr))
 				continue
 			}
 			ipnet = &net.IPNet{
@@ -106,21 +113,32 @@ func (m *IPBlocker) fetchIPs() error {
 	m.mu.Unlock()
 
 	m.logger.Info("updated blocked IP list",
-		zap.Int("count", len(parsed)))
+		zap.Int("count", len(parsed)),
+		zap.String("json_url", m.JSONUrl),
+		zap.Time("updated_at", time.Now()))
 
 	return nil
 }
 
 func (m *IPBlocker) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyhttp.Handler) error {
-	clientIP := net.ParseIP(r.RemoteAddr)
-	if clientIP == nil {
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		m.logger.Warn("failed to parse RemoteAddr", zap.String("remote_addr", r.RemoteAddr))
 		return next.ServeHTTP(w, r)
 	}
 
-	m.mu.RLock()
-	defer m.mu.RUnlock()
+	clientIP := net.ParseIP(host)
+	if clientIP == nil {
+		m.logger.Warn("failed to parse client IP", zap.String("remote_addr", r.RemoteAddr))
+		return next.ServeHTTP(w, r)
+	}
 
-	for _, ipnet := range m.blockedIPs {
+	// Copy the blocked IP list to reduce lock contention
+	m.mu.RLock()
+	blockedIPs := m.blockedIPs
+	m.mu.RUnlock()
+
+	for _, ipnet := range blockedIPs {
 		if ipnet.Contains(clientIP) {
 			m.logger.Debug("blocked request",
 				zap.String("ip", clientIP.String()),
@@ -134,6 +152,11 @@ func (m *IPBlocker) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddy
 	return next.ServeHTTP(w, r)
 }
 
+func (m *IPBlocker) Cleanup() error {
+	close(m.stopChan)
+	return nil
+}
+
 func (IPBlocker) CaddyModule() caddy.ModuleInfo {
 	return caddy.ModuleInfo{
 		ID:  "http.handlers.ip_blocker",
@@ -143,6 +166,7 @@ func (IPBlocker) CaddyModule() caddy.ModuleInfo {
 
 var (
 	_ caddy.Provisioner           = (*IPBlocker)(nil)
+	_ caddy.CleanerUpper          = (*IPBlocker)(nil)
 	_ caddy.Validator             = (*IPBlocker)(nil)
 	_ caddyhttp.MiddlewareHandler = (*IPBlocker)(nil)
 )
